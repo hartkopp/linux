@@ -158,6 +158,8 @@ struct tpcon {
 	u8 sbuf[DEFAULT_MAX_PDU_SIZE];
 };
 
+static DEFINE_SPINLOCK(isotp_notifier_lock);
+
 struct isotp_sock {
 	struct sock sk;
 	int bound;
@@ -178,15 +180,20 @@ struct isotp_sock {
 	u32 cfecho; /* consecutive frame echo tag */
 	u32 tx_gen; /* transfer generation, increased per new tx transfer */
 	u32 tx_result[ISOTP_TX_RESULT_SLOTS]; /* per-generation result slots */
-	struct tpcon rx, tx;
-	struct list_head notifier;
+	struct tpcon rx __guarded_by(&rx_lock);
+	/* A tx transfer is claimed and released by changing tx.state under
+	 * rx_lock. The owner of a claimed transfer and its timers access tx
+	 * locklessly, which can not be expressed with __guarded_by().
+	 */
+	struct tpcon tx;
+	struct list_head notifier __guarded_by(&isotp_notifier_lock);
 	wait_queue_head_t wait;
 	spinlock_t rx_lock; /* protect single thread state machine */
 };
 
-static LIST_HEAD(isotp_notifier_list);
-static DEFINE_SPINLOCK(isotp_notifier_lock);
-static struct isotp_sock *isotp_busy_notifier;
+static struct list_head isotp_notifier_list __guarded_by(&isotp_notifier_lock) =
+	LIST_HEAD_INIT(isotp_notifier_list);
+static struct isotp_sock *isotp_busy_notifier __guarded_by(&isotp_notifier_lock);
 
 /* increase (24 bit) tx generation value */
 static u32 isotp_inc_tx_gen(u32 gen)
@@ -264,6 +271,7 @@ static bool isotp_register_rxid(struct isotp_sock *so)
 }
 
 static enum hrtimer_restart isotp_rx_timer_handler(struct hrtimer *hrtimer)
+	__context_unsafe(/* lockless rx.state reset, rechecked in isotp_rcv_cf() */)
 {
 	struct isotp_sock *so = container_of(hrtimer, struct isotp_sock,
 					     rxtimer);
@@ -285,6 +293,7 @@ static enum hrtimer_restart isotp_rx_timer_handler(struct hrtimer *hrtimer)
 }
 
 static int isotp_send_fc(struct sock *sk, int ae, u8 flowstatus)
+	__must_hold(&isotp_sk(sk)->rx_lock)
 {
 	struct net_device *dev;
 	struct sk_buff *nskb;
@@ -440,6 +449,7 @@ static int check_pad(struct isotp_sock *so, struct canfd_frame *cf,
 static void isotp_send_cframe(struct isotp_sock *so);
 
 static int isotp_rcv_fc(struct isotp_sock *so, struct canfd_frame *cf, int ae)
+	__must_hold(&so->rx_lock)
 {
 	struct sock *sk = &so->sk;
 	int tx_err = EBADMSG; /* default for unknown FC status */
@@ -538,6 +548,7 @@ static int isotp_rcv_fc(struct isotp_sock *so, struct canfd_frame *cf, int ae)
 
 static int isotp_rcv_sf(struct sock *sk, struct canfd_frame *cf, int pcilen,
 			struct sk_buff *skb, int len)
+	__must_hold(&isotp_sk(sk)->rx_lock)
 {
 	struct isotp_sock *so = isotp_sk(sk);
 	struct sk_buff *nskb;
@@ -570,6 +581,7 @@ static int isotp_rcv_sf(struct sock *sk, struct canfd_frame *cf, int pcilen,
 }
 
 static int isotp_rcv_ff(struct sock *sk, struct canfd_frame *cf, int ae)
+	__must_hold(&isotp_sk(sk)->rx_lock)
 {
 	struct isotp_sock *so = isotp_sk(sk);
 	int i;
@@ -644,6 +656,7 @@ static int isotp_rcv_ff(struct sock *sk, struct canfd_frame *cf, int ae)
 
 static int isotp_rcv_cf(struct sock *sk, struct canfd_frame *cf, int ae,
 			struct sk_buff *skb)
+	__must_hold(&isotp_sk(sk)->rx_lock)
 {
 	struct isotp_sock *so = isotp_sk(sk);
 	struct sk_buff *nskb;
@@ -1474,8 +1487,8 @@ static int isotp_release(struct socket *sock)
 	 */
 	spin_lock_bh(&so->rx_lock);
 	WRITE_ONCE(so->tx.state, ISOTP_SHUTDOWN);
-	spin_unlock_bh(&so->rx_lock);
 	WRITE_ONCE(so->rx.state, ISOTP_IDLE);
+	spin_unlock_bh(&so->rx_lock);
 
 	/* forced SHUTDOWN may have skipped IDLE (gave up on a signal) */
 	wake_up_interruptible(&so->wait);
@@ -1586,14 +1599,15 @@ static int isotp_bind(struct socket *sock, struct sockaddr_unsized *uaddr, int l
 		goto out;
 	}
 
-	/* A transmission or reception that outlived a previous binding
+	/* Lockless check of the rx and tx states:
+	 * A transmission or reception that outlived a previous binding
 	 * (unbound by NETDEV_UNREGISTER) may still be draining; the FC/echo
 	 * and RX watchdog timers bound how long this takes. Checked together
 	 * with so->bound in the same lock_sock() section above, so there is
 	 * no window in which a concurrent isotp_notify() could be missed.
 	 */
-	if (READ_ONCE(so->tx.state) != ISOTP_IDLE ||
-	    READ_ONCE(so->rx.state) != ISOTP_IDLE) {
+	if (context_unsafe(READ_ONCE(so->rx.state)) != ISOTP_IDLE ||
+	    READ_ONCE(so->tx.state) != ISOTP_IDLE) {
 		err = -EAGAIN;
 		goto out;
 	}
@@ -1918,13 +1932,18 @@ static int isotp_notifier(struct notifier_block *nb, unsigned long msg,
 		return NOTIFY_DONE;
 	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
 		return NOTIFY_DONE;
-	if (unlikely(isotp_busy_notifier)) /* Check for reentrant bug. */
+	/* Check for reentrant bug. isotp_busy_notifier is only set by this
+	 * notifier, which is serialized by RTNL.
+	 */
+	if (context_unsafe(unlikely(isotp_busy_notifier)))
 		return NOTIFY_DONE;
 
 	spin_lock(&isotp_notifier_lock);
 	list_for_each_entry(isotp_busy_notifier, &isotp_notifier_list, notifier) {
+		struct isotp_sock *so = isotp_busy_notifier;
+
 		spin_unlock(&isotp_notifier_lock);
-		isotp_notify(isotp_busy_notifier, msg, dev);
+		isotp_notify(so, msg, dev);
 		spin_lock(&isotp_notifier_lock);
 	}
 	isotp_busy_notifier = NULL;
@@ -1933,6 +1952,7 @@ static int isotp_notifier(struct notifier_block *nb, unsigned long msg,
 }
 
 static void isotp_sock_destruct(struct sock *sk)
+	__context_unsafe(/* exclusive access on destruction */)
 {
 	struct isotp_sock *so = isotp_sk(sk);
 
@@ -1972,13 +1992,15 @@ static int isotp_init(struct sock *sk)
 	/* set ll_dl for tx path to similar place as for rx */
 	so->tx.ll_dl = so->ll.tx_dl;
 
-	so->rx.state = ISOTP_IDLE;
 	so->tx.state = ISOTP_IDLE;
-
-	so->rx.buf = so->rx.sbuf;
 	so->tx.buf = so->tx.sbuf;
-	so->rx.buflen = ARRAY_SIZE(so->rx.sbuf);
 	so->tx.buflen = ARRAY_SIZE(so->tx.sbuf);
+
+	scoped_guard(spinlock_init, &so->rx_lock) {
+		so->rx.state = ISOTP_IDLE;
+		so->rx.buf = so->rx.sbuf;
+		so->rx.buflen = ARRAY_SIZE(so->rx.sbuf);
+	}
 
 	hrtimer_setup(&so->rxtimer, isotp_rx_timer_handler,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
@@ -1990,7 +2012,6 @@ static int isotp_init(struct sock *sk)
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
 
 	init_waitqueue_head(&so->wait);
-	spin_lock_init(&so->rx_lock);
 
 	spin_lock(&isotp_notifier_lock);
 	list_add_tail(&so->notifier, &isotp_notifier_list);
