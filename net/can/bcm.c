@@ -396,7 +396,8 @@ out:
  *                    (consisting of bcm_msg_head + x CAN frames)
  */
 static void bcm_send_to_user(struct bcm_op *op, struct bcm_msg_head *head,
-			     struct canfd_frame *frames, int has_timestamp)
+			     struct canfd_frame *frames, ktime_t tstamp,
+			     int ifindex)
 {
 	struct sk_buff *skb;
 	struct canfd_frame *firstframe;
@@ -442,10 +443,8 @@ static void bcm_send_to_user(struct bcm_op *op, struct bcm_msg_head *head,
 		}
 	}
 
-	if (has_timestamp) {
-		/* restore rx timestamp */
-		skb->tstamp = op->rx_stamp;
-	}
+	/* restore rx timestamp (if any) */
+	skb->tstamp = tstamp;
 
 	/*
 	 *  Put the datagram to the queue so that bcm_recvmsg() can
@@ -457,7 +456,7 @@ static void bcm_send_to_user(struct bcm_op *op, struct bcm_msg_head *head,
 	addr = (struct sockaddr_can *)skb->cb;
 	memset(addr, 0, sizeof(*addr));
 	addr->can_family  = AF_CAN;
-	addr->can_ifindex = op->rx_ifindex;
+	addr->can_ifindex = ifindex;
 
 	reason = sock_queue_rcv_skb_reason(sk, skb);
 	if (reason) {
@@ -538,7 +537,8 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
 			msg_head.can_id  = op->can_id;
 			msg_head.nframes = 0;
 
-			bcm_send_to_user(op, &msg_head, NULL, 0);
+			/* tx ops have no rx_ifindex */
+			bcm_send_to_user(op, &msg_head, NULL, 0, 0);
 		}
 
 	} else if (tx_ival2) {
@@ -572,7 +572,7 @@ static void bcm_rx_changed(struct bcm_op *op, struct canfd_frame *data)
 	head.can_id  = op->can_id;
 	head.nframes = 1;
 
-	bcm_send_to_user(op, &head, data, 1);
+	bcm_send_to_user(op, &head, data, op->rx_stamp, op->rx_ifindex);
 }
 
 /*
@@ -682,6 +682,7 @@ static enum hrtimer_restart bcm_rx_timeout_handler(struct hrtimer *hrtimer)
 {
 	struct bcm_op *op = container_of(hrtimer, struct bcm_op, timer);
 	struct bcm_msg_head msg_head;
+	int ifindex;
 
 	spin_lock_bh(&op->bcm_rx_update_lock);
 
@@ -700,10 +701,11 @@ static enum hrtimer_restart bcm_rx_timeout_handler(struct hrtimer *hrtimer)
 	msg_head.ival2   = op->ival2;
 	msg_head.can_id  = op->can_id;
 	msg_head.nframes = 0;
+	ifindex = op->rx_ifindex;
 
 	spin_unlock_bh(&op->bcm_rx_update_lock);
 
-	bcm_send_to_user(op, &msg_head, NULL, 0);
+	bcm_send_to_user(op, &msg_head, NULL, 0, ifindex);
 
 	return HRTIMER_NORESTART;
 }
@@ -1037,6 +1039,7 @@ static int bcm_read_op(struct list_head *ops, struct bcm_msg_head *msg_head,
 		       int ifindex)
 {
 	struct bcm_op *op = bcm_find_op(ops, msg_head, ifindex);
+	int rx_ifindex = 0;
 
 	if (!op)
 		return -EINVAL;
@@ -1048,7 +1051,16 @@ static int bcm_read_op(struct list_head *ops, struct bcm_msg_head *msg_head,
 	msg_head->ival2   = op->ival2;
 	msg_head->nframes = op->nframes;
 
-	bcm_send_to_user(op, msg_head, op->frames, 0);
+	/* rx_ifindex is updated by bcm_rx_handler(). tx ops have no
+	 * rx_ifindex and do not initialize the bcm_rx_update_lock.
+	 */
+	if (msg_head->opcode == RX_STATUS) {
+		spin_lock_bh(&op->bcm_rx_update_lock);
+		rx_ifindex = op->rx_ifindex;
+		spin_unlock_bh(&op->bcm_rx_update_lock);
+	}
+
+	bcm_send_to_user(op, msg_head, op->frames, 0, rx_ifindex);
 
 	return MHSIZ;
 }
