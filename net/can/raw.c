@@ -81,12 +81,14 @@ struct uniqframe {
 	unsigned int join_rx_count;
 };
 
+static DEFINE_SPINLOCK(raw_notifier_lock);
+
 struct raw_sock {
 	struct sock sk;
 	struct net_device *dev;
 	netdevice_tracker dev_tracker;
 	struct net_device *bind_dev; /* hint for raw_notify(), no reference */
-	struct list_head notifier;
+	struct list_head notifier __guarded_by(&raw_notifier_lock);
 	int ifindex;
 	unsigned int bound:1;
 	unsigned int loopback:1;
@@ -105,9 +107,9 @@ struct raw_sock {
 	struct uniqframe __percpu *uniq;
 };
 
-static LIST_HEAD(raw_notifier_list);
-static DEFINE_SPINLOCK(raw_notifier_lock);
-static struct raw_sock *raw_busy_notifier;
+static struct list_head raw_notifier_list __guarded_by(&raw_notifier_lock) =
+	LIST_HEAD_INIT(raw_notifier_list);
+static struct raw_sock *raw_busy_notifier __guarded_by(&raw_notifier_lock);
 
 /* Return pointer to store the extra msg flags for raw_recvmsg().
  * We use the space of one unsigned int beyond the 'struct sockaddr_can'
@@ -368,13 +370,18 @@ static int raw_notifier(struct notifier_block *nb, unsigned long msg,
 		return NOTIFY_DONE;
 	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
 		return NOTIFY_DONE;
-	if (unlikely(raw_busy_notifier)) /* Check for reentrant bug. */
+	/* Check for reentrant bug. raw_busy_notifier is only set by this
+	 * notifier, which is serialized by RTNL.
+	 */
+	if (context_unsafe(unlikely(raw_busy_notifier)))
 		return NOTIFY_DONE;
 
 	spin_lock(&raw_notifier_lock);
 	list_for_each_entry(raw_busy_notifier, &raw_notifier_list, notifier) {
+		struct raw_sock *ro = raw_busy_notifier;
+
 		spin_unlock(&raw_notifier_lock);
-		raw_notify(raw_busy_notifier, msg, dev);
+		raw_notify(ro, msg, dev);
 		spin_lock(&raw_notifier_lock);
 	}
 	raw_busy_notifier = NULL;
