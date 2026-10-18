@@ -106,6 +106,14 @@ static inline u64 get_u64(const struct canfd_frame *cp, int offset)
 	return *(u64 *)(cp->data + offset);
 }
 
+/* The configuration of a bcm_op (flags, count, ival*, kt_ival*, nframes,
+ * frames) is changed in bcm_[tx|rx]_setup() under lock_sock(). As it is
+ * also accessed from the hrtimer and CAN receive paths, these updates are
+ * done under bcm_tx_lock for tx ops and under bcm_rx_update_lock for rx
+ * ops. As the lock depends on the type of the op, this can not be
+ * expressed with __guarded_by(). Members that are only used by one type
+ * of op are annotated with their lock.
+ */
 struct bcm_op {
 	struct list_head list;
 	struct rcu_head rcu;
@@ -116,13 +124,16 @@ struct bcm_op {
 	atomic_long_t frames_abs, frames_filtered;
 	struct bcm_timeval ival1, ival2;
 	struct hrtimer timer, thrtimer;
-	ktime_t rx_stamp, kt_ival1, kt_ival2, kt_lastmsg;
-	int rx_ifindex;
-	int if_detected; /* first received ifindex in ANYDEV rx_op mode */
+	ktime_t kt_ival1, kt_ival2;
+	ktime_t rx_stamp __guarded_by(&bcm_rx_update_lock);
+	ktime_t kt_lastmsg __guarded_by(&bcm_rx_update_lock);
+	int rx_ifindex __guarded_by(&bcm_rx_update_lock);
+	/* first received ifindex in ANYDEV rx_op mode */
+	int if_detected __guarded_by(&bcm_rx_update_lock);
 	int cfsiz;
 	u32 count;
 	u32 nframes;
-	u32 currframe;
+	u32 currframe __guarded_by(&bcm_tx_lock);
 	/* void pointers to arrays of struct can[fd]_frame */
 	void *frames;
 	void *last_frames;
@@ -135,11 +146,13 @@ struct bcm_op {
 	spinlock_t bcm_rx_update_lock; /* protect filter/timer data updates */
 };
 
+static DEFINE_SPINLOCK(bcm_notifier_lock);
+
 struct bcm_sock {
 	struct sock sk;
 	int bound;
 	int ifindex;
-	struct list_head notifier;
+	struct list_head notifier __guarded_by(&bcm_notifier_lock);
 	struct list_head rx_ops;
 	struct list_head tx_ops;
 	unsigned long dropped_usr_msgs;
@@ -147,9 +160,9 @@ struct bcm_sock {
 	char procname [32]; /* inode number in decimal with \0 */
 };
 
-static LIST_HEAD(bcm_notifier_list);
-static DEFINE_SPINLOCK(bcm_notifier_lock);
-static struct bcm_sock *bcm_busy_notifier;
+static struct list_head bcm_notifier_list __guarded_by(&bcm_notifier_lock) =
+	LIST_HEAD_INIT(bcm_notifier_list);
+static struct bcm_sock *bcm_busy_notifier __guarded_by(&bcm_notifier_lock);
 
 /* Return pointer to store the extra msg flags for bcm_recvmsg().
  * We use the space of one unsigned int beyond the 'struct sockaddr_can'
@@ -305,6 +318,7 @@ static void bcm_update_rx_stats(struct bcm_op *op)
 }
 
 static void bcm_update_tx_stats(struct bcm_op *op)
+	__must_hold(&op->bcm_tx_lock)
 {
 	/* tx_op has no reduction% calculation - use the full range and
 	 * just keep the displayed counter non-negative on overflow
@@ -553,6 +567,7 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
  * bcm_rx_changed - create a RX_CHANGED notification due to changed content
  */
 static void bcm_rx_changed(struct bcm_op *op, struct canfd_frame *data)
+	__must_hold(&op->bcm_rx_update_lock)
 {
 	struct bcm_msg_head head;
 
@@ -584,6 +599,7 @@ static void bcm_rx_update_and_send(struct bcm_op *op,
 				   struct canfd_frame *lastdata,
 				   const struct canfd_frame *rxdata,
 				   unsigned char traffic_flags)
+	__must_hold(&op->bcm_rx_update_lock)
 {
 	memcpy(lastdata, rxdata, op->cfsiz);
 
@@ -631,6 +647,7 @@ rx_changed_settime:
 static void bcm_rx_cmp_to_index(struct bcm_op *op, unsigned int index,
 				const struct canfd_frame *rxdata,
 				unsigned char traffic_flags)
+	__must_hold(&op->bcm_rx_update_lock)
 {
 	struct canfd_frame *cf = op->frames + op->cfsiz * index;
 	struct canfd_frame *lcf = op->last_frames + op->cfsiz * index;
@@ -669,6 +686,7 @@ static void bcm_rx_cmp_to_index(struct bcm_op *op, unsigned int index,
  * bcm_rx_starttimer - enable timeout monitoring for CAN frame reception
  */
 static void bcm_rx_starttimer(struct bcm_op *op)
+	__must_hold(&op->bcm_rx_update_lock)
 {
 	if (op->flags & RX_NO_AUTOTIMER)
 		return;
@@ -714,6 +732,7 @@ static enum hrtimer_restart bcm_rx_timeout_handler(struct hrtimer *hrtimer)
  * bcm_rx_do_flush - helper for bcm_rx_thr_flush
  */
 static inline int bcm_rx_do_flush(struct bcm_op *op, unsigned int index)
+	__must_hold(&op->bcm_rx_update_lock)
 {
 	struct canfd_frame *lcf = op->last_frames + op->cfsiz * index;
 
@@ -728,6 +747,7 @@ static inline int bcm_rx_do_flush(struct bcm_op *op, unsigned int index)
  * bcm_rx_thr_flush - Check for throttled data and send it to the userspace
  */
 static int bcm_rx_thr_flush(struct bcm_op *op)
+	__must_hold(&op->bcm_rx_update_lock)
 {
 	int updated = 0;
 
@@ -1467,8 +1487,10 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 		sock_hold(sk);
 		op->ifindex = ifindex;
 
-		/* ifindex for timeout events w/o previous frame reception */
-		op->rx_ifindex = ifindex;
+		/* ifindex for timeout events w/o previous frame reception
+		 * (op is not visible to bcm_rx_handler() yet)
+		 */
+		context_unsafe(op->rx_ifindex = ifindex);
 
 		/* initialize uninitialized (kzalloc) structure */
 		hrtimer_setup(&op->timer, bcm_rx_timeout_handler, CLOCK_MONOTONIC,
@@ -1872,13 +1894,18 @@ static int bcm_notifier(struct notifier_block *nb, unsigned long msg,
 		return NOTIFY_DONE;
 	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
 		return NOTIFY_DONE;
-	if (unlikely(bcm_busy_notifier)) /* Check for reentrant bug. */
+	/* Check for reentrant bug. bcm_busy_notifier is only set by this
+	 * notifier, which is serialized by RTNL.
+	 */
+	if (context_unsafe(unlikely(bcm_busy_notifier)))
 		return NOTIFY_DONE;
 
 	spin_lock(&bcm_notifier_lock);
 	list_for_each_entry(bcm_busy_notifier, &bcm_notifier_list, notifier) {
+		struct bcm_sock *bo = bcm_busy_notifier;
+
 		spin_unlock(&bcm_notifier_lock);
-		bcm_notify(bcm_busy_notifier, msg, dev);
+		bcm_notify(bo, msg, dev);
 		spin_lock(&bcm_notifier_lock);
 	}
 	bcm_busy_notifier = NULL;
