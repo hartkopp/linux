@@ -413,8 +413,8 @@ static int j1939_sk_init(struct sock *sk)
 	jsk->addr.pgn = J1939_NO_PGN;
 	jsk->pgn_rx_filter = J1939_NO_PGN;
 	atomic_set(&jsk->skb_pending, 0);
-	spin_lock_init(&jsk->sk_session_queue_lock);
-	INIT_LIST_HEAD(&jsk->sk_session_queue);
+	scoped_guard(spinlock_init, &jsk->sk_session_queue_lock)
+		INIT_LIST_HEAD(&jsk->sk_session_queue);
 	spin_lock_init(&jsk->filters_lock);
 
 	/* j1939_sk_sock_destruct() depends on SOCK_RCU_FREE flag */
@@ -662,7 +662,8 @@ static int j1939_sk_release(struct socket *sock)
 		j1939_netdev_stop(priv);
 	}
 
-	kfree(jsk->filters);
+	/* the socket is not reachable from the rx path anymore */
+	kfree(context_unsafe(jsk->filters));
 	sock_orphan(sk);
 	sock->sk = NULL;
 

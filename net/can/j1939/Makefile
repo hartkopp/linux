@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 
+CONTEXT_ANALYSIS := y
+
 obj-$(CONFIG_CAN_J1939) += can-j1939.o
 
 can-j1939-objs := \

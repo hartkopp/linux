@@ -45,7 +45,7 @@ struct j1939_ecu {
 };
 
 struct j1939_priv {
-	struct list_head ecus;
+	struct list_head ecus __guarded_by(&lock);
 	/* local list entry in priv
 	 * These allow irq (& softirq) context lookups on j1939 devices
 	 * This approach (separate lists) is done as the other 2 alternatives
@@ -70,7 +70,7 @@ struct j1939_priv {
 		struct j1939_ecu *ecu;
 		/* count users, to help transport protocol */
 		int nusers;
-	} ents[256];
+	} ents[256] __guarded_by(&lock);
 
 	struct kref kref;
 
@@ -80,7 +80,8 @@ struct j1939_priv {
 	 * Do not start two sessions of same type, addresses and
 	 * direction.
 	 */
-	struct list_head active_session_list;
+	struct list_head active_session_list
+		__guarded_by(&active_session_list_lock);
 
 	/* protects active_session_list */
 	spinlock_t active_session_list_lock;
@@ -89,7 +90,7 @@ struct j1939_priv {
 
 	/* lock for j1939_socks list */
 	rwlock_t j1939_socks_lock;
-	struct list_head j1939_socks;
+	struct list_head j1939_socks __guarded_by(&j1939_socks_lock);
 
 	struct kref rx_kref;
 	u32 rx_tskey;
@@ -306,8 +307,8 @@ struct j1939_sock {
 	int ifindex;
 	struct j1939_addr addr;
 	spinlock_t filters_lock;
-	struct j1939_filter *filters;
-	int nfilters;
+	struct j1939_filter *filters __guarded_by(&filters_lock);
+	int nfilters __guarded_by(&filters_lock);
 	pgn_t pgn_rx_filter;
 
 	/* j1939 may emit equal PGN (!= equal CAN-id's) out of order
@@ -319,7 +320,7 @@ struct j1939_sock {
 
 	/* lock for the sk_session_queue list */
 	spinlock_t sk_session_queue_lock;
-	struct list_head sk_session_queue;
+	struct list_head sk_session_queue __guarded_by(&sk_session_queue_lock);
 };
 
 static inline struct j1939_sock *j1939_sk(const struct sock *sk)

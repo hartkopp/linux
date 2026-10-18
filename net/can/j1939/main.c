@@ -122,6 +122,7 @@ static void j1939_can_recv(struct sk_buff *iskb, void *data)
 #define J1939_CAN_ID CAN_EFF_FLAG
 #define J1939_CAN_MASK (CAN_EFF_FLAG | CAN_RTR_FLAG)
 
+/* protects the j1939_priv pointer in the can_ml_priv of a CAN device */
 static DEFINE_MUTEX(j1939_netdev_lock);
 
 static struct j1939_priv *j1939_priv_create(struct net_device *ndev)
@@ -132,8 +133,8 @@ static struct j1939_priv *j1939_priv_create(struct net_device *ndev)
 	if (!priv)
 		return NULL;
 
-	rwlock_init(&priv->lock);
-	INIT_LIST_HEAD(&priv->ecus);
+	scoped_guard(rwlock_init, &priv->lock)
+		INIT_LIST_HEAD(&priv->ecus);
 	priv->ndev = ndev;
 	kref_init(&priv->kref);
 	kref_init(&priv->rx_kref);
@@ -146,6 +147,7 @@ static struct j1939_priv *j1939_priv_create(struct net_device *ndev)
 
 static inline void j1939_priv_set(struct net_device *ndev,
 				  struct j1939_priv *priv)
+	__must_hold(&j1939_netdev_lock)
 {
 	struct can_ml_priv *can_ml = can_get_ml_priv(ndev);
 
@@ -153,6 +155,7 @@ static inline void j1939_priv_set(struct net_device *ndev,
 }
 
 static void __j1939_priv_release(struct kref *kref)
+	__context_unsafe(/* last reference, exclusive access */)
 {
 	struct j1939_priv *priv = container_of(kref, struct j1939_priv, kref);
 	struct net_device *ndev = priv->ndev;
@@ -221,6 +224,7 @@ static void __j1939_rx_release(struct kref *kref)
 
 /* get pointer to priv without increasing ref counter */
 static inline struct j1939_priv *j1939_ndev_to_priv(struct net_device *ndev)
+	__must_hold(&j1939_netdev_lock)
 {
 	struct can_ml_priv *can_ml = can_get_ml_priv(ndev);
 
@@ -228,6 +232,7 @@ static inline struct j1939_priv *j1939_ndev_to_priv(struct net_device *ndev)
 }
 
 static struct j1939_priv *j1939_priv_get_by_ndev_locked(struct net_device *ndev)
+	__must_hold(&j1939_netdev_lock)
 {
 	struct j1939_priv *priv;
 
@@ -270,8 +275,8 @@ struct j1939_priv *j1939_netdev_start(struct net_device *ndev)
 		return ERR_PTR(-ENOMEM);
 
 	j1939_tp_init(priv);
-	rwlock_init(&priv->j1939_socks_lock);
-	INIT_LIST_HEAD(&priv->j1939_socks);
+	scoped_guard(rwlock_init, &priv->j1939_socks_lock)
+		INIT_LIST_HEAD(&priv->j1939_socks);
 
 	mutex_lock(&j1939_netdev_lock);
 	priv_new = j1939_priv_get_by_ndev_locked(ndev);

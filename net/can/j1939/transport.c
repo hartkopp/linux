@@ -235,11 +235,13 @@ static int j1939_xtp_abort_to_errno(struct j1939_priv *priv,
 }
 
 static inline void j1939_session_list_lock(struct j1939_priv *priv)
+	__acquires(&priv->active_session_list_lock)
 {
 	spin_lock_bh(&priv->active_session_list_lock);
 }
 
 static inline void j1939_session_list_unlock(struct j1939_priv *priv)
+	__releases(&priv->active_session_list_lock)
 {
 	spin_unlock_bh(&priv->active_session_list_lock);
 }
@@ -2257,7 +2259,7 @@ int j1939_cancel_active_session(struct j1939_priv *priv, struct sock *sk)
 
 void j1939_tp_init(struct j1939_priv *priv)
 {
-	spin_lock_init(&priv->active_session_list_lock);
-	INIT_LIST_HEAD(&priv->active_session_list);
+	scoped_guard(spinlock_init, &priv->active_session_list_lock)
+		INIT_LIST_HEAD(&priv->active_session_list);
 	priv->tp_max_packet_size = J1939_MAX_ETP_PACKET_SIZE;
 }
