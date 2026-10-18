@@ -3,6 +3,8 @@
 #  Makefile for the Linux Controller Area Network core.
 #
 
+CONTEXT_ANALYSIS := y
+
 obj-$(CONFIG_CAN)	+= can.o
 can-y			:= af_can.o
 can-$(CONFIG_PROC_FS)	+= proc.o

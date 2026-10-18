@@ -327,6 +327,8 @@ static int can_reset_stats_proc_show(struct seq_file *m, void *v)
 static inline void can_rcvlist_proc_show_one(struct seq_file *m, int idx,
 					     struct net_device *dev,
 					     struct can_dev_rcv_lists *dev_rcv_lists)
+	__must_hold_shared(RCU)
+	__context_unsafe(/* RCU reader of the receive lists */)
 {
 	if (!hlist_empty(&dev_rcv_lists->rx[idx])) {
 		can_print_recv_banner(m);
@@ -393,6 +395,7 @@ static inline void can_rcvlist_proc_show_array(struct seq_file *m,
 }
 
 static int can_rcvlist_sff_proc_show(struct seq_file *m, void *v)
+	__context_unsafe(/* RCU reader of the receive lists */)
 {
 	struct net_device *dev;
 	struct can_dev_rcv_lists *dev_rcv_lists;
@@ -426,6 +429,7 @@ static int can_rcvlist_sff_proc_show(struct seq_file *m, void *v)
 }
 
 static int can_rcvlist_eff_proc_show(struct seq_file *m, void *v)
+	__context_unsafe(/* RCU reader of the receive lists */)
 {
 	struct net_device *dev;
 	struct can_dev_rcv_lists *dev_rcv_lists;

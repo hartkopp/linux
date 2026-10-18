@@ -79,8 +79,9 @@ MODULE_PARM_DESC(stats_timer, "enable timer for statistics (default:on)");
 static struct kmem_cache *rcv_cache __read_mostly;
 
 /* table of registered CAN protocols */
-static const struct can_proto __rcu *proto_tab[CAN_NPROTO] __read_mostly;
 static DEFINE_MUTEX(proto_tab_lock);
+static const struct can_proto __rcu *proto_tab[CAN_NPROTO] __read_mostly
+	__guarded_by(&proto_tab_lock, RCU);
 
 static atomic_t skbcounter = ATOMIC_INIT(0);
 
@@ -365,6 +366,7 @@ static unsigned int effhash(canid_t can_id)
  */
 static struct hlist_head *can_rcv_list_find(canid_t *can_id, canid_t *mask,
 					    struct can_dev_rcv_lists *dev_rcv_lists)
+	__must_hold(&dev_rcv_lists->lock)
 {
 	canid_t inv = *can_id & CAN_INV_FILTER; /* save flag before masking */
 
@@ -586,6 +588,8 @@ static inline void deliver(struct sk_buff *skb, struct receiver *rcv)
 }
 
 static int can_rcv_filter(struct can_dev_rcv_lists *dev_rcv_lists, struct sk_buff *skb)
+	__must_hold_shared(RCU)
+	__context_unsafe(/* RCU reader of the receive lists */)
 {
 	struct receiver *rcv;
 	int matches = 0;

@@ -29,12 +29,13 @@ struct netns_can {
 
 	/* receive filters subscribed for 'all' CAN devices */
 	struct can_dev_rcv_lists *rx_alldev_list;
-	spinlock_t rcvlists_lock; /* protects rcv_lists_stats */
+	/* protects rcv_entries and rcv_entries_max in rcv_lists_stats */
+	spinlock_t rcvlists_lock;
 	struct timer_list stattimer; /* timer for statistics update */
 	struct can_pkg_stats *pkg_stats;
 	struct can_rcv_lists_stats *rcv_lists_stats;
 
-	/* CAN GW per-net gateway jobs */
+	/* CAN GW per-net gateway jobs (modified under RTNL, RCU readers) */
 	struct hlist_head cgw_list;
 };
 

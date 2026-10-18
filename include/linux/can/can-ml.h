@@ -59,12 +59,17 @@
 
 enum { RX_ERR, RX_ALL, RX_FIL, RX_INV, RX_MAX };
 
+/* The receive lists of a CAN device or the 'any' CAN device lists of a
+ * namespace. They are modified under @lock only. The rx path and procfs
+ * traverse them locklessly under RCU, which can not be expressed with
+ * __guarded_by(); these readers opt out of the context analysis.
+ */
 struct can_dev_rcv_lists {
-	spinlock_t lock; /* protects the receive lists and entries */
-	struct hlist_head rx[RX_MAX];
-	struct hlist_head rx_sff[CAN_SFF_RCV_ARRAY_SZ];
-	struct hlist_head rx_eff[CAN_EFF_RCV_ARRAY_SZ];
-	int entries;
+	spinlock_t lock;
+	struct hlist_head rx[RX_MAX] __guarded_by(&lock);
+	struct hlist_head rx_sff[CAN_SFF_RCV_ARRAY_SZ] __guarded_by(&lock);
+	struct hlist_head rx_eff[CAN_EFF_RCV_ARRAY_SZ] __guarded_by(&lock);
+	int entries __guarded_by(&lock);
 };
 
 struct can_ml_priv {
