@@ -23,3 +23,26 @@
 		stdout-path = "serial0:115200n8";
 	};
 };
+
+/*
+ * FDCAN1/FDCAN2 routed to the CN2 (Raspberry Pi compatible) GPIO connector.
+ * External CAN FD transceivers (e.g. MCP2562FD) have to be attached:
+ *
+ * FDCAN1: PA12 (TX) -> CN2 pin 03, PA11 (RX) -> CN2 pin 05 (shared with I2C5)
+ * FDCAN2: PB13 (TX) -> CN2 pin 36, PB12 (RX) -> CN2 pin 10 (shared with USART3)
+ *
+ * I2C5 and USART3 are disabled in stm32mp15xx-dkx.dtsi, so there is no conflict.
+ */
+&m_can1 {
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&m_can1_pins_b>;
+	pinctrl-1 = <&m_can1_sleep_pins_b>;
+	status = "okay";
+};
+
+&m_can2 {
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&m_can2_pins_b>;
+	pinctrl-1 = <&m_can2_sleep_pins_b>;
+	status = "okay";
+};
